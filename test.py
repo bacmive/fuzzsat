@@ -1,6 +1,13 @@
 import random
 import os
+import re
+import string
+import tempfile
+import subprocess
 from pprint import pprint
+from shutil import copy2
+
+from ub import do_ub
 
 FOLLOW_UP_TESTS = 'follow-up-tests'
 SS_UU = 'SAT->SAT\nUNSAT->UNSAT\n'
@@ -115,37 +122,157 @@ def do_func(sut_path, inputs_path, seed):
         transformations = transform(clauses, int(no_of_clauses), int(no_of_vars))
         pprint("after transformations: ")
         pprint(transformations)
-        
-        # if not os.path.exists(FOLLOW_UP_TESTS):
-        #     os.makedirs(FOLLOW_UP_TESTS)
 
-        # for i, transformation in enumerate(transformations):
-        #     print('Formula {}: Writing transformation {}'.format(x, i))
 
-        #     cnf_filename = os.path.join(FOLLOW_UP_TESTS, '{}_{}.cnf'.format(str(x).zfill(2), str(i).zfill(2)))
-        #     txt_filename = os.path.join(FOLLOW_UP_TESTS, '{}_{}.txt'.format(str(x).zfill(2), str(i).zfill(2)))
+ #-----------------------------------do ub---------------------------------------#
 
-        #     with open(cnf_filename, 'w') as new_cnf, open(txt_filename, 'w') as new_txt:
-        #         formula, new_no_of_clauses, sat_string = transformation
 
-        #         # Write first line
-        #         first_line = 'p cnf {} {}\n'.format(no_of_vars, new_no_of_clauses)
-        #         new_cnf.write(first_line)
+SAVED_INPUTS_PATH = "fuzzed-tests/"
+saved_inputs_id = 0
 
-        #         # Write clauses
-        #         for line in formula:
-        #             new_line = ' '.join(map(lambda lit: str(lit), line)) + '\n'
-        #             new_cnf.write(new_line)
+REGEXES = {
+    "INTMIN_NEGATED_REGEX": re.compile('^.*runtime.+negation'),
+    "NULLPOINTER_REGEX": re.compile('^.*runtime.+null pointer'),
+    "SHIFT_ERROR_REGEX": re.compile('^.*runtime.+shift'),
+    "USE_AFTER_FREE_REGEX": re.compile('^==.*AddressSanitizer: heap-use-after-free'),
+    "HEAP_BUFFER_OVERFLOW_REGEX": re.compile('^==.*AddressSanitizer: heap-buffer-overflow'),
+    "STACK_BUFFER_OVERFLOW_REGEX": re.compile('^==.*AddressSanitizer: stack-buffer-overflow'),
+    "SIGNED_INTEGER_OVERFLOW_REGEX": re.compile('^.*runtime.+signed integer')
+}
 
-        #         # Write sat_string
-        #         new_txt.write(sat_string)
+INTERSTING_CNFS = ["p cnf 0 0",
+                   "p cnf 10 20\n!\"#$%&'()*+,-./:;<=>?@[\]^_`{|}~",
+                   "p cnf 10 20\n\n\n0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ!\"#$%&'()*+,-./:;<=>?@[\]^_`{|}~ 	\n0\n00123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ!\"#$%&'()*+,-./:;<=>?@[\]^_`{|}~ 	\n",
+                   "p cnf 10 20\n\n\n01234567890123456789"]
+
+DIGITS_NO_ZERO = string.digits.replace("0", "")
+
+def do_ub(sut_path, inputs_path, seed):
+    if seed is not None:
+        random.seed(seed)
+    else:
+        random.seed()
+
+    i = 0
+
+    while True:
+        if i < len(INTERSTING_CNFS):
+            cnf = INTERSTING_CNFS[i]
+            print("Sending interesting cnf")
+        else:
+            if i % 2 == 0:
+                print("Sending input")
+                cnf = create_input()
+            else:
+                print("Sending garbage")
+                cnf = create_garbage()
+
+        input_file = make_cnf_file(cnf)
+
+        sut_output = run_sut(input_file, sut_path)
+
+        if sut_output is not None:
+            ubs = check_ub(sut_output)
+
+            if ubs > 0:
+                save_input(sut_path, input_file)
+
+        input_file.close()
+
+        i += 1
+
+def create_input():
+    number_of_formulas = 100000
+    NUMBER_OF_LITERALS = 999
+    formulas_width = 10
+
+    cnf = "p cnf " + str(NUMBER_OF_LITERALS) + " " + str(number_of_formulas) + "\n999 0\n"
+    for i in range(0, number_of_formulas):
+        for j in range(0, formulas_width):
+            cnf += ["", "-"][int(random.random() * 1)]
+            num_width = random.randint(1, 3)
+            for k in range(0, num_width):
+                cnf += DIGITS_NO_ZERO[int(random.random() * 9)]
+            cnf += " "
+        cnf += "0\n"
+
+    return cnf
+
+def create_garbage():
+    # nums_of_forms = random.randint(1, 20)
+    # nums_of_vars = random.randint(1, 10)
+    # cnf = "p cnf " + str(nums_of_forms) + " " + str(nums_of_vars)
+    # cnf += " \n"
+    cnf = "p cnf 10 20\n"
+
+    while True:
+        choice = random.randint(0, 5)
+        if choice == 0:
+            if len(cnf) >= 20:
+                break
+        elif choice == 1:
+            cnf += string.punctuation
+        elif choice == 2:
+            cnf += string.printable
+        elif choice == 3:
+            cnf += string.digits
+        elif choice == 4:
+            cnf += '0'
+        elif choice == 5:
+            cnf += '\n'
+
+    return cnf
+
+def make_cnf_file(cnf):
+    input_file = tempfile.NamedTemporaryFile(mode='w')
+    input_file.write(cnf)
+    input_file.flush()
+    return input_file
+
+def run_sut(input_file, sut_path):
+    result = subprocess.Popen(["./runsat.sh", input_file.name], stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                              cwd=sut_path)
+    
+    try:
+        sut_output, sut_error = result.communicate(timeout=10)
+    except subprocess.TimeoutExpired:
+        result.kill()
+        print("TIMEOUT")
+        return None
+
+    sut_output_printable = sut_output.decode('ascii').split('\n')
+
+    for line in sut_output_printable:
+        print(line)
+
+    return sut_error
+    
+
+def check_ub(sut_error):
+    if sut_error == None:
+        return 1
+    
+    ubs = 0
+    for line in sut_error.decode('ascii').split('\n'):
+        for key, value in REGEXES.items():
+            if value.match(line):
+                print(line)
+                ubs += 1
+
+    return ubs
+
+def save_input(sut_path, temp_file):
+    global saved_inputs_id
+
+    os.makedirs(os.path.join(sut_path, SAVED_INPUTS_PATH), exist_ok=True)
+
+    output_file = open(os.path.join(sut_path, SAVED_INPUTS_PATH, "interesting_input{}.txt".format(saved_inputs_id)),
+                       'w+')
+
+    copy2(temp_file.name, output_file.name)
+
+    saved_inputs_id = (saved_inputs_id + 1) % 20
 
 if __name__ == "__main__":
     # do_func("./suts/solver1", "./inputs", None)
-    try:
-        a = b = 1
-        raise ValueError
-    except ValueError as e:
-        print(a)
-
-    print(a)
+    do_ub("./suts/solver1/", None, None)

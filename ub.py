@@ -37,7 +37,7 @@ def do_ub(sut_path, inputs_path, seed):
     i = 0
 
     while True:
-        if i <= len(INTERSTING_CNFS) - 1:
+        if i < len(INTERSTING_CNFS):
             cnf = INTERSTING_CNFS[i]
             print("Sending interesting cnf")
         else:
@@ -68,7 +68,8 @@ def create_input():
     NUMBER_OF_LITERALS = 999
     formulas_width = 10
 
-    cnf = "p cnf " + str(NUMBER_OF_LITERALS) + " " + str(number_of_formulas) + "\n999 0\n"
+    cnf = "p cnf " + str(NUMBER_OF_LITERALS) + " " + \
+        str(number_of_formulas) + "\n999 0\n"
     for i in range(0, number_of_formulas):
         for j in range(0, formulas_width):
             cnf += ["", "-"][int(random.random() * 1)]
@@ -117,15 +118,29 @@ def run_sut(input_file, sut_path):
         sut_output, sut_error = result.communicate(timeout=20)
     except subprocess.TimeoutExpired:
         result.kill()
-        sut_output, sut_error = result.communicate()
-
-
+        print("TIMEOUT")
+        return None
+        
     sut_output_printable = sut_output.decode('ascii').split('\n')
 
     for line in sut_output_printable:
         print(line)
 
     return sut_error
+
+
+def check_ub(sut_error):
+    if sut_error == None:
+        return 1
+    
+    ubs = 0
+    for line in sut_error.decode('ascii').split('\n'):
+        for key, value in REGEXES.items():
+            if value.match(line):
+                print(line)
+                ubs += 1
+
+    return ubs
 
 
 def save_input(sut_path, temp_file):
@@ -139,14 +154,3 @@ def save_input(sut_path, temp_file):
     copy2(temp_file.name, output_file.name)
 
     saved_inputs_id = (saved_inputs_id + 1) % 20
-
-
-def check_ub(sut_error):
-    ubs = 0
-    for line in sut_error.decode('ascii ').split('\n'):
-        for key, value in REGEXES.items():
-            if value.match(line):
-                print(line)
-                ubs += 1
-
-    return ubs
